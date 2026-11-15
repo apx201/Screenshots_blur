@@ -30,7 +30,7 @@ from ore_ui import (FONT, ORE, OreButton, OreCard, OreCheck, OreEntry, OreLabel,
                     OreProgress, OreScrollbar, OreSlider, OreTabs, shade)
 
 APP_NAME = "截图打码工具"
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
 # 参考分辨率（样例截图 3168x1440）中 UID 文字的外框：x 250..464, y 1379..1422
