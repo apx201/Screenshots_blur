@@ -26,7 +26,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageTk
 
 import ore_ui
-from ore_ui import (FONT, ORE, OreButton, OreCard, OreEntry, OreLabel,
+from ore_ui import (FONT, ORE, OreButton, OreCard, OreCheck, OreEntry, OreLabel,
                     OreProgress, OreScrollbar, OreSlider, OreTabs, shade)
 
 APP_NAME = "截图打码工具"
@@ -149,16 +149,42 @@ def process_one(src: Path, dst: Path, rects, strength, mode, feather, fill,
     return dst
 
 
-def build_jobs(items, outdir: Path, suffix: str):
+def make_output_stem(stem: str, number: int, prefix: str = "", suffix: str = "_已打码",
+                     numbering: bool = False, pad: bool = False, width: int = 2) -> str:
+    """生成输出文件名（不含扩展名）。
+
+    · 填了前缀就用前缀，否则沿用原文件名
+    · 勾选编号：末尾加「空格 + 序号」，如 `我的世界 1`
+    · 未勾选编号：末尾加后缀，如 `我的世界_已打码`
+    """
+    base = (prefix or "").strip() or stem
+    if numbering:
+        num = str(int(number)).zfill(width) if pad else str(int(number))
+        return f"{base} {num}"
+    return f"{base}{suffix or ''}"
+
+
+def build_jobs(items, outdir: Path, suffix: str, prefix: str = "", numbering: bool = False,
+               start: int = 1, pad: bool = False, lossless: bool = False):
     """items: [(源文件, 相对路径), ...] -> [(源, 目标)]，自动避免同名覆盖。"""
-    suffix = suffix or "_已打码"
+    suffix = suffix if suffix is not None else "_已打码"
+    start = max(0, int(start))
+    total = len(items)
+    width = max(2, len(str(start + max(0, total - 1)))) if pad else 2
     jobs, used = [], set()
-    for src, rel in items:
+    for i, (src, rel) in enumerate(items):
         rel = Path(rel)
-        dst = outdir / rel.parent / (rel.stem + suffix + rel.suffix)
+        stem = make_output_stem(rel.stem, start + i, prefix, suffix, numbering, pad, width)
+        ext = ".png" if lossless else rel.suffix
+        dst = outdir / rel.parent / (stem + ext)
+        try:  # 后缀/前缀被清空且输出目录=原目录时，避免覆盖原图
+            if dst.resolve() == Path(src).resolve():
+                dst = outdir / rel.parent / (stem + "_已打码" + ext)
+        except OSError:
+            pass
         n = 2
         while dst in used:
-            dst = outdir / rel.parent / f"{rel.stem}{suffix} ({n}){rel.suffix}"
+            dst = outdir / rel.parent / f"{stem} ({n}){ext}"
             n += 1
         used.add(dst)
         jobs.append((Path(src), dst))
@@ -186,6 +212,32 @@ def collect_inputs(inputs, recursive=True, suffix=""):
         else:
             skipped += 1
     return items, skipped
+
+
+def parse_color(text, fallback=(18, 20, 26)):
+    """把 #rgb / #rrggbb / rgb(r,g,b) / r,g,b 解析成 (r,g,b)。"""
+    import re
+
+    t = (text or "").strip().lower()
+    m = re.fullmatch(r"#([0-9a-f]{3})", t)
+    if m:
+        h = m.group(1)
+        return tuple(int(c * 2, 16) for c in h)
+    m = re.fullmatch(r"#([0-9a-f]{6})", t)
+    if m:
+        h = m.group(1)
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    m = re.fullmatch(r"rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*(?:,[^)]*)?\)", t)
+    if m:
+        return tuple(max(0, min(255, int(v))) for v in m.groups()[:3])
+    m = re.fullmatch(r"(\d{1,3})\s*[, ]\s*(\d{1,3})\s*[, ]\s*(\d{1,3})", t)
+    if m:
+        return tuple(max(0, min(255, int(v))) for v in m.groups())
+    return fallback
+
+
+def color_to_hex(rgb) -> str:
+    return "#%02x%02x%02x" % tuple(int(v) for v in rgb[:3])
 
 
 def parse_rect(text: str):
@@ -273,12 +325,21 @@ class BlurApp:
         self.feather = tk.DoubleVar(value=2.0)
         self.mode = tk.StringVar(value="gaussian")
         self.quality = tk.IntVar(value=95)
+        self.lossless = tk.BooleanVar(value=True)
         self.suffix = tk.StringVar(value="_已打码")
+        self.prefix = tk.StringVar(value="")
+        self.numbering = tk.BooleanVar(value=False)
+        self.start_num = tk.StringVar(value="1")
+        self.pad = tk.BooleanVar(value=False)
         self.outdir = tk.StringVar(value="")
         self.fill_color = (18, 20, 26)
+        self.fill_text = tk.StringVar(value="#12141a")
 
         self._build_style()
         self._build_ui()
+        self._draw_swatch()
+        self._sync_color_row()
+        self._sync_quality_row()
         self._bind_shortcuts()
         self.ready = True
         self._refresh_list()
@@ -431,7 +492,7 @@ class BlurApp:
         right.pack_propagate(False)
         self.scroll = ScrollFrame(right)
         panel = self.scroll.inner
-        self.card = OreCard(panel, pad=12)
+        self.card = OreCard(panel, pad=8)
         self.card.pack(fill="x")
 
         self._build_images_section(self.card)
@@ -456,7 +517,7 @@ class BlurApp:
         self._icon = img
 
     def _separator(self, parent):
-        self.tk.Frame(parent, bg=ORE["bg"], height=1).pack(fill="x", pady=9)
+        self.tk.Frame(parent, bg=ORE["bg"], height=1).pack(fill="x", pady=5)
 
     def _section(self, parent, title, desc=None):
         box = self.tk.Frame(parent, bg=ORE["panel"])
@@ -530,19 +591,16 @@ class BlurApp:
         self.entry_vars = {}
         for i, (key, label) in enumerate((("x", "X %"), ("y", "Y %"),
                                           ("w", "宽 %"), ("h", "高 %"))):
-            r, c = divmod(i, 2)
             cell = tk.Frame(grid, bg=ORE["panel"])
-            cell.grid(row=r, column=c, sticky="ew", padx=(0 if c == 0 else 10, 0),
-                      pady=2)
-            OreLabel(cell, label, kind="muted").pack(side="left", padx=(0, 6))
+            cell.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 8, 0), pady=2)
+            OreLabel(cell, label, kind="tiny").pack(side="left", padx=(0, 4))
             var = tk.StringVar()
             self.entry_vars[key] = var
-            e = OreEntry(cell, textvariable=var, width=8)
+            e = OreEntry(cell, textvariable=var, width=5)
             e.pack(side="left", fill="x", expand=True)
             e.bind("<Return>", self._apply_entries)
             e.bind("<FocusOut>", self._apply_entries)
-        grid.columnconfigure(0, weight=1)
-        grid.columnconfigure(1, weight=1)
+            grid.columnconfigure(i, weight=1)
 
     # ---- 打码效果 ----
     def _build_effect_section(self, parent):
@@ -553,16 +611,34 @@ class BlurApp:
                                  command=lambda k: self._on_effect_change())
         self.mode_tabs.pack(fill="x", pady=(8, 10))
 
+        # 纯色模式的颜色选择
+        self.color_row = tk.Frame(box, bg=ORE["panel"])
+        OreLabel(self.color_row, "颜色", kind="body").pack(side="left")
+        self.swatch = tk.Canvas(self.color_row, width=36, height=28, bg=ORE["panel"],
+                                highlightthickness=2, highlightbackground=ORE["border"],
+                                bd=0, cursor="hand2")
+        self.swatch.pack(side="left", padx=(8, 8))
+        self.swatch.bind("<Button-1>", lambda e: self.pick_color())
+        OreEntry(self.color_row, textvariable=self.fill_text, width=15).pack(side="left")
+        OreButton(self.color_row, "取色…", command=self.pick_color, variant="ghost",
+                  size="small", width=66).pack(side="left", padx=(8, 0))
+        self.fill_text_entry = self.color_row.winfo_children()[-2]
+        self.fill_text_entry.bind("<Return>", self._apply_fill_text)
+        self.fill_text_entry.bind("<FocusOut>", self._apply_fill_text)
+
         srow = tk.Frame(box, bg=ORE["panel"])
         srow.pack(fill="x")
+        self.strength_row = srow
         OreLabel(srow, "模糊强度", kind="body").pack(side="left")
         self.strength_value = OreLabel(srow, "7.0", kind="value")
         self.strength_value.pack(side="right")
-        OreSlider(box, self.strength, 1, 40, height=30,
-                  command=lambda v: self._on_strength()).pack(fill="x", pady=(2, 0))
+        self.strength_slider = OreSlider(box, self.strength, 1, 40, height=30,
+                                         command=lambda v: self._on_strength())
+        self.strength_slider.pack(fill="x", pady=(2, 0))
 
         frow = tk.Frame(box, bg=ORE["panel"])
         frow.pack(fill="x", pady=(6, 0))
+        self.feather_row = frow
         OreLabel(frow, "边缘羽化", kind="body").pack(side="left")
         self.feather_value = OreLabel(frow, "2 px", kind="value")
         self.feather_value.pack(side="right")
@@ -582,24 +658,47 @@ class BlurApp:
         box = self._section(parent, "输出")
 
         drow = tk.Frame(box, bg=ORE["panel"])
-        drow.pack(fill="x", pady=(8, 8))
+        drow.pack(fill="x", pady=(8, 6))
         OreEntry(drow, textvariable=self.outdir).pack(side="left", fill="x",
                                                       expand=True)
         OreButton(drow, "浏览", command=self.choose_outdir, variant="ghost",
                   size="small", width=62).pack(side="left", padx=(8, 0))
 
+        prow = tk.Frame(box, bg=ORE["panel"])
+        prow.pack(fill="x", pady=(0, 4))
+        OreLabel(prow, "前缀", kind="muted").pack(side="left")
+        OreEntry(prow, textvariable=self.prefix, width=12).pack(side="left", padx=(6, 10))
+        self.name_example = OreLabel(prow, "", kind="muted")
+        self.name_example.pack(side="right")
+
+        nrow = tk.Frame(box, bg=ORE["panel"])
+        nrow.pack(fill="x", pady=(0, 6))
+        OreCheck(nrow, "顺序编号", variable=self.numbering,
+                 command=self._on_name_change).pack(side="left")
+        OreLabel(nrow, "起始", kind="muted").pack(side="left", padx=(14, 4))
+        OreEntry(nrow, textvariable=self.start_num, width=5).pack(side="left")
+        OreCheck(nrow, "补零", variable=self.pad,
+                 command=self._on_name_change).pack(side="left", padx=(12, 0))
+
         orow = tk.Frame(box, bg=ORE["panel"])
         orow.pack(fill="x")
         OreLabel(orow, "后缀", kind="muted").pack(side="left")
-        OreEntry(orow, textvariable=self.suffix, width=10).pack(side="left", padx=(6, 16))
-        self.quality_label = OreLabel(orow, "画质 95", kind="value")
-        self.quality_label.pack(side="right")
-        qbox = tk.Frame(orow, bg=ORE["panel"], width=150, height=30)
-        qbox.pack(side="right", padx=(0, 10))
+        OreEntry(orow, textvariable=self.suffix, width=10).pack(side="left", padx=(6, 12))
+        OreCheck(orow, "无损 PNG", variable=self.lossless,
+                 command=self._on_lossless_change).pack(side="left")
+
+        self.qrow = tk.Frame(box, bg=ORE["panel"])
+        OreLabel(self.qrow, "画质", kind="muted").pack(side="left")
+        qbox = tk.Frame(self.qrow, bg=ORE["panel"], width=150, height=30)
+        qbox.pack(side="left", padx=(8, 8))
         qbox.pack_propagate(False)
         OreSlider(qbox, self.quality, 60, 100, height=30, step=1,
                   command=lambda v: self._update_hints()).pack(fill="both", expand=True)
+        self.quality_label = OreLabel(self.qrow, "95", kind="value")
+        self.quality_label.pack(side="left")
         self.quality.trace_add("write", lambda *a: self._update_hints())
+        for v in (self.prefix, self.start_num, self.numbering, self.pad):
+            v.trace_add("write", lambda *a: self._update_name_example())
 
     # ---------------- 事件与快捷键 ----------------
     def _bind_shortcuts(self):
@@ -742,7 +841,59 @@ class BlurApp:
 
     def _on_effect_change(self):
         self._update_hints()
+        self._sync_color_row()
         self._schedule_preview()
+
+    def _sync_color_row(self):
+        """纯色模式：显示颜色行，隐藏强度行（纯色用不到强度）。"""
+        if not hasattr(self, "color_row"):
+            return
+        solid = self.mode.get() == "solid"
+        # 注意：pack(before=X) 要求 X 当前已 pack，所以统一以始终显示的 feather_row 为锚点
+        if solid:
+            if not self.color_row.winfo_manager():
+                self.color_row.pack(fill="x", pady=(2, 6), before=self.feather_row)
+            self.strength_row.pack_forget()
+            self.strength_slider.pack_forget()
+            self.strength_hint.pack_forget()
+        else:
+            self.color_row.pack_forget()
+            if not self.strength_row.winfo_manager():
+                self.strength_row.pack(fill="x", before=self.feather_row)
+            if not self.strength_slider.winfo_manager():
+                self.strength_slider.pack(fill="x", pady=(2, 0),
+                                          before=self.feather_row)
+            if not self.strength_hint.winfo_manager():
+                self.strength_hint.pack(anchor="w", pady=(8, 0))
+
+    def _set_fill(self, rgb, sync_text=True):
+        self.fill_color = tuple(max(0, min(255, int(v))) for v in rgb[:3])
+        if sync_text:
+            self.fill_text.set(color_to_hex(self.fill_color))
+        self._draw_swatch()
+        self._schedule_preview()
+
+    def _draw_swatch(self):
+        if not hasattr(self, "swatch"):
+            return
+        self.swatch.delete("all")
+        self.swatch.create_rectangle(0, 0, 36, 28, fill=color_to_hex(self.fill_color),
+                                     outline="")
+
+    def _apply_fill_text(self, _event=None):
+        rgb = parse_color(self.fill_text.get(), fallback=None)
+        if rgb:
+            self._set_fill(rgb)
+        else:
+            self.fill_text.set(color_to_hex(self.fill_color))
+
+    def pick_color(self):
+        from tkinter import colorchooser
+
+        rgb, hexv = colorchooser.askcolor(color=color_to_hex(self.fill_color),
+                                          title="选择打码颜色")
+        if hexv:
+            self._set_fill(parse_color(hexv))
 
     def _update_hints(self):
         s = self.strength.get()
@@ -751,9 +902,52 @@ class BlurApp:
         if self.src_thumb is not None:
             w = self.full_size[0]
             self.strength_hint.configure(
-                text=f"当前 {w}px 宽 → 半径/块约 {radius_for(w, s)}px（按宽度比例换算）"
+                text=f"当前 {w}px 宽 → 半径/块约 {radius_for(w, s)}px"
             )
-        self.quality_label.configure(text=f"画质 {int(round(self.quality.get()))}")
+        self.quality_label.configure(text=f"{int(round(self.quality.get()))}")
+        self._update_name_example()
+
+    def _numbering_start(self) -> int:
+        try:
+            return max(0, int(float(self.start_num.get())))
+        except Exception:
+            return 1
+
+    def _on_name_change(self):
+        self._update_hints()
+
+    def _on_lossless_change(self):
+        self._sync_quality_row()
+        self._update_name_example()
+
+    def _sync_quality_row(self):
+        """无损模式不需要画质滑杆。"""
+        if not hasattr(self, "qrow"):
+            return
+        if self.lossless.get():
+            self.qrow.pack_forget()
+        elif not self.qrow.winfo_manager():
+            self.qrow.pack(fill="x", pady=(6, 0))
+
+    def _update_name_example(self):
+        if not hasattr(self, "name_example"):
+            return
+        stem = Path(self.current_path).stem if self.current_path else "截图"
+        start = self._numbering_start()
+        total = max(1, len(self.items))
+        width = max(2, len(str(start + total - 1))) if self.pad.get() else 2
+        name = make_output_stem(
+            stem, start, self.prefix.get(), self.suffix.get().strip(),
+            bool(self.numbering.get()), bool(self.pad.get()), width
+        )
+        ext = (".png" if self.lossless.get()
+               else (Path(self.current_path).suffix if self.current_path else ".jpg"))
+        shown = name if len(name) <= 18 else name[:17] + "…"
+        tip = ""
+        if (self.prefix.get().strip() and not self.numbering.get()
+                and len(self.items) > 1):
+            tip = "（多张会重名）"
+        self.name_example.configure(text=f"示例：{shown}{ext}{tip}")
 
     def _schedule_preview(self):
         if not self.ready:
@@ -1122,8 +1316,10 @@ class BlurApp:
             self.outdir.set(outdir_text)
         outdir = Path(outdir_text)
 
-        suffix = self.suffix.get().strip() or "_已打码"
-        jobs = build_jobs(self.items, outdir, suffix)
+        suffix = self.suffix.get().strip()
+        jobs = build_jobs(self.items, outdir, suffix, self.prefix.get().strip(),
+                          bool(self.numbering.get()), self._numbering_start(),
+                          bool(self.pad.get()), bool(self.lossless.get()))
         self.rects = [[float(v) for v in r] for r in self.rects]
         self._refresh_regions_list()
 
@@ -1233,7 +1429,8 @@ def run_cli(args) -> int:
 
     rects = [parse_rect(t) for t in args.rect] if args.rect else [DEFAULT_RECT]
     outdir = Path(args.output) if args.output else items[0][0].parent / "打码输出"
-    jobs = build_jobs(items, outdir, args.suffix)
+    jobs = build_jobs(items, outdir, args.suffix, args.prefix, args.numbering,
+                      args.start, args.pad, not args.no_lossless)
     print(f"共 {len(jobs)} 张，输出到：{outdir}")
     print(f"区域：{rects}  模式：{MODE_LABELS.get(args.mode, args.mode)}  "
           f"强度：{args.strength}")
@@ -1242,7 +1439,8 @@ def run_cli(args) -> int:
     for src, dst in jobs:
         try:
             process_one(src, dst, rects=rects, strength=args.strength, mode=args.mode,
-                        feather=args.feather, fill=(0, 0, 0), quality=args.quality)
+                        feather=args.feather, fill=parse_color(args.fill),
+                        quality=args.quality)
             ok += 1
             print(f"  [OK] {src.name} -> {dst}")
         except Exception as exc:
@@ -1263,10 +1461,19 @@ def build_arg_parser():
     p.add_argument("--mode", default="gaussian", choices=["gaussian", "mosaic", "solid"],
                    help="打码方式，默认 gaussian")
     p.add_argument("--feather", type=int, default=2, help="边缘羽化像素，默认 2")
+    p.add_argument("--fill", default="#12141a",
+                   help="纯色遮盖的颜色，支持 #rrggbb / rgb(r,g,b)，默认 #12141a")
     p.add_argument("--rect", action="append",
                    help="打码区域 x0,y0,x1,y1（0~1 相对坐标，可重复）；默认左下角 UID 区域")
     p.add_argument("--suffix", default="_已打码", help="输出文件名后缀，默认 _已打码")
+    p.add_argument("--prefix", default="", help="输出文件名前缀（留空则沿用原文件名）")
+    p.add_argument("--numbering", action="store_true",
+                   help="按顺序在文件名末尾加 1、2、3…（上传顺序）")
+    p.add_argument("--start", type=int, default=1, help="编号起始值，默认 1")
+    p.add_argument("--pad", action="store_true", help="编号补零（01、02…）")
     p.add_argument("--quality", type=int, default=95, help="JPG/WebP 画质，默认 95")
+    p.add_argument("--no-lossless", action="store_true",
+                   help="按原格式保存（默认输出无损 PNG）")
     p.add_argument("--no-recursive", action="store_true", help="文件夹不递归子目录")
     return p
 

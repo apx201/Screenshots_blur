@@ -386,6 +386,53 @@ class OreTabs(tk.Frame):
 
 
 # --------------------------------------------------------------------------- #
+# 复选框
+# --------------------------------------------------------------------------- #
+class OreCheck(tk.Canvas):
+    """Ore UI 风格复选框：18px 方块 + 文字，选中变绿并打勾。"""
+
+    def __init__(self, master, text="", variable=None, command=None, bg=None,
+                 font_size=10, **kw):
+        import tkinter.font as _tkfont
+
+        self.var = variable if variable is not None else tk.BooleanVar(value=False)
+        self.text = text
+        self.bg = bg or parent_bg(master)
+        self.command = command
+        self.font_size = font_size
+        f = _tkfont.Font(family=FONT, size=font_size)
+        w = f.measure(text) + 18 + 12
+        super().__init__(master, width=w, height=26, bg=self.bg, highlightthickness=0,
+                         bd=0, takefocus=1, cursor="hand2", **kw)
+        self.bind("<Button-1>", self._toggle)
+        self.bind("<space>", self._toggle)
+        self.bind("<Configure>", lambda e: self._draw())
+        self.var.trace_add("write", lambda *a: self._draw())
+
+    def _toggle(self, _e=None):
+        self.var.set(not bool(self.var.get()))
+        if self.command:
+            self.command()
+
+    def _draw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 10 or h < 10:
+            return
+        box = 18
+        x, y = 1, (h - box) // 2
+        checked = bool(self.var.get())
+        fill = ORE["green"] if checked else ORE["field"]
+        self.create_rectangle(x, y, x + box, y + box, fill=fill, outline=ORE["border"],
+                              width=2)
+        if checked:
+            self.create_line(x + 4, y + 9, x + 7, y + 13, x + 14, y + 5,
+                             fill="#ffffff", width=2)
+        self.create_text(x + box + 8, h // 2, anchor="w", text=self.text,
+                         fill=ORE["ink"], font=(FONT, self.font_size))
+
+
+# --------------------------------------------------------------------------- #
 # 进度条
 # --------------------------------------------------------------------------- #
 class OreProgress(tk.Canvas):
