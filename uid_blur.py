@@ -50,8 +50,33 @@ MODE_LABELS = {"gaussian": "高斯模糊", "mosaic": "马赛克", "solid": "纯�
 # --------------------------------------------------------------------------- #
 # 图像处理核心（界面与命令行共用）
 # --------------------------------------------------------------------------- #
+def to_srgb(im: Image.Image) -> Image.Image:
+    """带 ICC 配置的图片（如 Display P3 截图）统一转到 sRGB。
+
+    不转的话，输出文件没有色彩配置，会被当成 sRGB 显示，颜色就偏了。
+    """
+    icc = im.info.pop("icc_profile", None)
+    if not icc:
+        return im
+    try:
+        import io
+
+        from PIL import ImageCms
+
+        src = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+        dst = ImageCms.createProfile("sRGB")
+        if im.mode == "RGBA":
+            rgb = ImageCms.profileToProfile(im.convert("RGB"), src, dst,
+                                            outputMode="RGB")
+            rgb.putalpha(im.getchannel("A"))
+            return rgb
+        return ImageCms.profileToProfile(im, src, dst, outputMode="RGB")
+    except Exception:
+        return im
+
+
 def load_image(path: Path) -> Image.Image:
-    """读取图片，按 EXIF 方向摆正，统一成 RGB / RGBA。"""
+    """读取图片，按 EXIF 方向摆正，统一成 RGB / RGBA 并转到 sRGB。"""
     im = Image.open(path)
     im = ImageOps.exif_transpose(im)
     if getattr(im, "is_animated", False):
@@ -60,7 +85,7 @@ def load_image(path: Path) -> Image.Image:
         im = im.convert("RGBA")
     elif im.mode != "RGB":
         im = im.convert("RGB")
-    return im
+    return to_srgb(im)
 
 
 def _rect_to_px(rect, w: int, h: int):
@@ -124,7 +149,8 @@ def apply_mask(im: Image.Image, rects, strength: float = 7.0, mode: str = "gauss
 
 
 def save_image(im: Image.Image, path: Path, quality: int = 95) -> None:
-    """按扩展名保存；不写入 EXIF，避免原图元数据被带出去。"""
+    """按扩展名保存；不写入 EXIF / 原图 ICC，避免元数据被带出去。"""
+    im.info.pop("icc_profile", None)
     path.parent.mkdir(parents=True, exist_ok=True)
     ext = path.suffix.lower()
     if ext in (".jpg", ".jpeg"):
