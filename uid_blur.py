@@ -29,8 +29,8 @@ import ore_ui
 from ore_ui import (FONT, ORE, OreButton, OreCard, OreCheck, OreEntry, OreLabel,
                     OreProgress, OreScrollbar, OreSlider, OreTabs, shade)
 
-APP_NAME = "截图打码工具"
-APP_VERSION = "1.2"
+APP_NAME = "Wiki人的图片小工具"
+APP_VERSION = "1.3"
 SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
 # 参考分辨率（样例截图 3168x1440）中 UID 文字的外框：x 250..464, y 1379..1422
@@ -45,6 +45,55 @@ DEFAULT_RECT = (
 )
 
 MODE_LABELS = {"gaussian": "高斯模糊", "mosaic": "马赛克", "solid": "纯色遮盖"}
+
+# 裁剪比例（宽 / 高）
+CROP_RATIOS = {"16:9": 16 / 9, "4:3": 4 / 3, "1:1": 1.0, "9:16": 9 / 16, "3:4": 3 / 4}
+
+
+def crop_box_for(w, h, ratio_key, scale=1.0, cw=1920, ch=1080, ox=0.5, oy=0.5):
+    """算出裁剪框（图像像素）：比例模式按最大内接 × scale，自定义模式按 cw×ch。"""
+    if ratio_key == "custom":
+        bw = max(1, min(int(round(cw)), int(w)))
+        bh = max(1, min(int(round(ch)), int(h)))
+    else:
+        r = CROP_RATIOS.get(ratio_key, 16 / 9)
+        bw, bh = int(w), int(round(w / r))
+        if bh > h:
+            bh, bw = int(h), int(round(h * r))
+        s = max(0.1, min(1.0, float(scale)))
+        bw = max(8, int(round(bw * s)))
+        bh = max(8, int(round(bh * s)))
+    x = int(round(ox * w - bw / 2))
+    y = int(round(oy * h - bh / 2))
+    x = max(0, min(int(w) - bw, x))
+    y = max(0, min(int(h) - bh, y))
+    return x, y, bw, bh
+
+
+def crop_max_for(w, h, ratio_key):
+    """比例模式下、scale=1 时的最大裁剪尺寸。"""
+    if ratio_key == "custom":
+        return int(w), int(h)
+    r = CROP_RATIOS.get(ratio_key, 16 / 9)
+    bw, bh = int(w), int(round(w / r))
+    if bh > h:
+        bh, bw = int(h), int(round(h * r))
+    return max(1, bw), max(1, bh)
+
+
+def crop_image(im: Image.Image, crop: dict) -> Image.Image:
+    """按裁剪参数裁一张图；自定义尺寸时不足会放大到目标尺寸。"""
+    w, h = im.size
+    x, y, bw, bh = crop_box_for(w, h, crop.get("ratio", "16:9"),
+                                crop.get("scale", 1.0), crop.get("w", 1920),
+                                crop.get("h", 1080), crop.get("ox", 0.5),
+                                crop.get("oy", 0.5))
+    out = im.crop((x, y, x + bw, y + bh))
+    if crop.get("ratio") == "custom":
+        tw, th = max(1, int(round(crop.get("w", 1920)))), max(1, int(round(crop.get("h", 1080))))
+        if out.size != (tw, th):
+            out = out.resize((tw, th), Image.LANCZOS)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -167,10 +216,14 @@ def save_image(im: Image.Image, path: Path, quality: int = 95) -> None:
         im.save(path)
 
 
-def process_one(src: Path, dst: Path, rects, strength, mode, feather, fill,
-                quality=95) -> Path:
+def process_one(src: Path, dst: Path, rects=None, strength=7, mode="gaussian",
+                feather=2, fill=(18, 20, 26), quality=95, crop=None) -> Path:
     im = load_image(src)
-    out = apply_mask(im, rects, strength=strength, mode=mode, feather=feather, fill=fill)
+    if crop:
+        out = crop_image(im, crop)
+    else:
+        out = apply_mask(im, rects, strength=strength, mode=mode,
+                         feather=feather, fill=fill)
     save_image(out, dst, quality=quality)
     return dst
 
@@ -361,6 +414,15 @@ class BlurApp:
         self.fill_color = (18, 20, 26)
         self.fill_text = tk.StringVar(value="#12141a")
 
+        # 模式与裁剪
+        self.work_mode = tk.StringVar(value="blur")
+        self.crop_ratio = tk.StringVar(value="16:9")
+        self.crop_scale = 1.0
+        self.crop_offset = [0.5, 0.5]
+        self.crop_w = tk.StringVar(value="1920")
+        self.crop_h = tk.StringVar(value="1080")
+        self.crop_drag = None
+
         self._build_style()
         self._build_ui()
         self._draw_swatch()
@@ -487,7 +549,7 @@ class BlurApp:
         self.canvas.bind("<ButtonPress-3>", lambda e: self._toggle_before(True))
         self.canvas.bind("<ButtonRelease-3>", lambda e: self._toggle_before(False))
 
-        zoom_card = OreCard(left, pad=10)
+        self.zoom_card = zoom_card = OreCard(left, pad=10)
         zoom_card.pack(fill="x", pady=(10, 0))
         zhead = tk.Frame(zoom_card, bg=ORE["panel"])
         zhead.pack(fill="x")
@@ -500,7 +562,7 @@ class BlurApp:
         self.zoom.pack(fill="x", pady=(8, 0))
         self.zoom.bind("<Configure>", lambda e: self._render_zoom())
 
-        log_card = OreCard(left, pad=10)
+        self.log_card = log_card = OreCard(left, pad=10)
         log_card.pack(fill="x", pady=(10, 0))
         OreLabel(log_card, "日志", kind="section", bg=ORE["panel"]).pack(anchor="w")
         self.log = tk.Text(log_card, height=3, width=20, bg=ORE["field"], fg=ORE["muted"], bd=0,
@@ -521,11 +583,26 @@ class BlurApp:
         self.card = OreCard(panel, pad=8)
         self.card.pack(fill="x")
 
+        self.work_tabs = OreTabs(self.card, {"blur": "打码", "crop": "裁剪"},
+                                 self.work_mode,
+                                 command=lambda k: self._on_mode_change())
+        self.work_tabs.pack(fill="x")
+        self._separator(self.card)
+
         self._build_images_section(self.card)
         self._separator(self.card)
-        self._build_region_section(self.card)
-        self._separator(self.card)
-        self._build_effect_section(self.card)
+
+        self.work_holder = tk.Frame(self.card, bg=ORE["panel"])
+        self.work_holder.pack(fill="x")
+        self.blur_box = tk.Frame(self.work_holder, bg=ORE["panel"])
+        self.blur_box.pack(fill="x")
+        self._build_region_section(self.blur_box)
+        self._separator(self.blur_box)
+        self._build_effect_section(self.blur_box)
+
+        self.crop_box = tk.Frame(self.work_holder, bg=ORE["panel"])
+        self._build_crop_section(self.crop_box)
+
         self._separator(self.card)
         self._build_output_section(self.card)
         self.canvas.focus_set()
@@ -726,6 +803,123 @@ class BlurApp:
         for v in (self.prefix, self.start_num, self.numbering, self.pad):
             v.trace_add("write", lambda *a: self._update_name_example())
 
+    # ---------------- 模式 / 裁剪 ----------------
+    def _on_mode_change(self):
+        crop = self.work_mode.get() == "crop"
+        if crop:
+            self.blur_box.pack_forget()
+            self.crop_box.pack(fill="x")
+            self.zoom_card.pack_forget()
+            self.btn_start.configure(text="开始批量裁剪")
+            if self.suffix.get().strip() == "_已打码":
+                self.suffix.set("_裁剪")
+        else:
+            self.crop_box.pack_forget()
+            self.blur_box.pack(fill="x")
+            if not self.zoom_card.winfo_manager():
+                self.zoom_card.pack(fill="x", pady=(10, 0), before=self.log_card)
+            self.btn_start.configure(text="开始批量打码")
+            if self.suffix.get().strip() == "_裁剪":
+                self.suffix.set("_已打码")
+            if self.current_path is not None:
+                self.status.configure(
+                    text=f"{self.current_path.name}    {self.full_size[0]}×{self.full_size[1]}"
+                         f"    区域 {len(self.rects)} 个")
+        self._update_name_example()
+        self._update_crop_info()
+        self._schedule_preview()
+
+    def _num(self, var, default):
+        try:
+            return float(str(var.get()).strip() or default)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _crop_size_px(self):
+        """当前裁剪输出尺寸（像素）。"""
+        if self.src_full is None:
+            return 0, 0
+        w, h = self.src_full.size
+        if self.crop_ratio.get() == "custom":
+            return (max(1, int(round(self._num(self.crop_w, 1920)))),
+                    max(1, int(round(self._num(self.crop_h, 1080)))))
+        bw, bh = crop_max_for(w, h, self.crop_ratio.get())
+        s = max(0.1, min(1.0, self.crop_scale))
+        return max(8, int(round(bw * s))), max(8, int(round(bh * s)))
+
+    def _crop_box(self, w, h):
+        """按当前设置算出裁剪框（返回 x, y, w, h）。自定义尺寸从原图换算到预览坐标。"""
+        fw = self.full_size[0] or w
+        k = w / max(1, fw)
+        return crop_box_for(w, h, self.crop_ratio.get(), self.crop_scale,
+                            self._num(self.crop_w, 1920) * k,
+                            self._num(self.crop_h, 1080) * k,
+                            self.crop_offset[0], self.crop_offset[1])
+
+    def _build_crop_section(self, parent):
+        tk = self.tk
+        box = self._section(parent, "裁剪设置")
+        OreTabs(box, {"16:9": "16:9", "4:3": "4:3", "1:1": "1:1",
+                      "9:16": "9:16", "3:4": "3:4", "custom": "自定义"},
+                self.crop_ratio,
+                command=lambda k: self._on_crop_ratio_change()).pack(fill="x", pady=(8, 0))
+
+        self.crop_size_row = tk.Frame(box, bg=ORE["panel"])
+        OreLabel(self.crop_size_row, "宽", kind="muted").pack(side="left")
+        OreEntry(self.crop_size_row, textvariable=self.crop_w,
+                 width=6).pack(side="left", padx=(4, 12))
+        OreLabel(self.crop_size_row, "高", kind="muted").pack(side="left")
+        OreEntry(self.crop_size_row, textvariable=self.crop_h,
+                 width=6).pack(side="left", padx=(4, 12))
+        OreLabel(self.crop_size_row, "px", kind="muted").pack(side="left")
+
+        self.crop_hint = OreLabel(box, "", kind="muted", wraplength=396, justify="left")
+        self.crop_hint.pack(anchor="w", pady=(8, 0))
+        self.crop_hint2 = OreLabel(
+            box, "拖动预览里的白框移动位置，拖四个角/边可缩放（所有图片共用同一位置）。",
+            kind="muted", wraplength=396, justify="left")
+        self.crop_hint2.pack(anchor="w", pady=(4, 0))
+
+        self.crop_w.trace_add("write", lambda *a: self._on_crop_size_change())
+        self.crop_h.trace_add("write", lambda *a: self._on_crop_size_change())
+        self._sync_crop_size_row()
+
+    def _sync_crop_size_row(self):
+        if not hasattr(self, "crop_size_row"):
+            return
+        if self.crop_ratio.get() == "custom":
+            if not self.crop_size_row.winfo_manager():
+                self.crop_size_row.pack(fill="x", pady=(8, 0), before=self.crop_hint)
+        else:
+            self.crop_size_row.pack_forget()
+
+    def _on_crop_ratio_change(self):
+        self.crop_scale = 1.0
+        self.crop_offset = [0.5, 0.5]
+        self._sync_crop_size_row()
+        self._update_crop_info()
+        self._schedule_preview()
+
+    def _on_crop_size_change(self):
+        self._update_crop_info()
+        self._schedule_preview()
+
+    def _update_crop_info(self):
+        if not hasattr(self, "crop_hint"):
+            return
+        bw, bh = self._crop_size_px()
+        if self.src_full is None:
+            self.crop_hint.configure(text="添加图片后可预览裁剪效果")
+            return
+        if self.crop_ratio.get() == "custom":
+            self.crop_hint.configure(text=f"输出 {bw}×{bh} px · 原图不够大时会放大")
+        else:
+            self.crop_hint.configure(text=f"{self.crop_ratio.get()} · 输出 {bw}×{bh} px")
+        if self.work_mode.get() == "crop" and self.current_path is not None:
+            self.status.configure(
+                text=f"{self.current_path.name}    {self.full_size[0]}×{self.full_size[1]}"
+                     f"  →  {bw}×{bh}    {self.crop_ratio.get()}")
+
     # ---------------- 事件与快捷键 ----------------
     def _bind_shortcuts(self):
         self.root.bind("<Control-o>", lambda e: self.add_files())
@@ -833,6 +1027,7 @@ class BlurApp:
         self.preview = None
         self.current_path = None
         self._refresh_list()
+        self._update_crop_info()
         self._render()
 
     # ---------------- 预览 ----------------
@@ -851,6 +1046,7 @@ class BlurApp:
         self.src_thumb = thumb
         self.src_full = im
         self._update_hints()
+        self._update_crop_info()
         self._rebuild_preview()
         self._sync_entries()
         self.status.configure(
@@ -988,7 +1184,7 @@ class BlurApp:
             self.preview = None
             self._render()
             return
-        if self.show_before:
+        if self.show_before or self.work_mode.get() == "crop":
             self.preview = self.src_thumb
         else:
             self.preview = apply_mask(
@@ -1028,9 +1224,17 @@ class BlurApp:
         ox, oy = (cw - dw) // 2, (ch - dh) // 2
         disp = self.preview if (dw, dh) == self.preview.size else \
             self.preview.resize((dw, dh), Image.LANCZOS)
+        if self.work_mode.get() == "crop" and self.src_thumb is not None:
+            disp = self._dim_outside_crop(disp)
         self.photo = ImageTk.PhotoImage(disp)
         c.create_image(ox, oy, anchor="nw", image=self.photo)
         self.view = (ox, oy, dw, dh)
+
+        if self.work_mode.get() == "crop" and self.src_thumb is not None:
+            iw, ih = self.preview.size
+            self._draw_crop_overlay(c, ox, oy, dw, dh, iw, ih)
+            self._update_crop_info()
+            return
 
         for idx, rect in enumerate(self.rects):
             x0, y0, x1, y1 = self._rect_to_canvas(rect)
@@ -1096,6 +1300,141 @@ class BlurApp:
                  f"半径/块 ≈ {radius}px · 放大 {scale:.1f}×"
         )
 
+    # ---- 裁剪模式的叠加层与拖拽 ----
+    def _draw_crop_overlay(self, c, ox, oy, dw, dh, iw, ih):
+        x, y, bw, bh = self._crop_box(iw, ih)
+        sx, sy = dw / max(1, iw), dh / max(1, ih)
+        x0, y0 = ox + x * sx, oy + y * sy
+        x1, y1 = x0 + bw * sx, y0 + bh * sy
+        for i in (1, 2):
+            gx = x0 + (x1 - x0) * i / 3
+            gy = y0 + (y1 - y0) * i / 3
+            c.create_line(gx, y0, gx, y1, fill="#ffffff", width=1, stipple="gray25")
+            c.create_line(x0, gy, x1, gy, fill="#ffffff", width=1, stipple="gray25")
+        c.create_rectangle(x0, y0, x1, y1, outline="#ffffff", width=2)
+        for hx, hy in ((x0, y0), ((x0 + x1) / 2, y0), (x1, y0),
+                       (x0, (y0 + y1) / 2), (x1, (y0 + y1) / 2),
+                       (x0, y1), ((x0 + x1) / 2, y1), (x1, y1)):
+            c.create_rectangle(hx - 4, hy - 4, hx + 4, hy + 4,
+                               fill="#ffffff", outline=ORE["border"], width=2)
+
+    def _dim_outside_crop(self, disp):
+        base = disp.convert("RGB")
+        dim = base.point(lambda v: int(v * 0.45))
+        w, h = base.size
+        x, y, bw, bh = self._crop_box(w, h)
+        if bw > 0 and bh > 0:
+            dim.paste(base.crop((x, y, x + bw, y + bh)), (x, y))
+        return dim
+
+    def _crop_handles_canvas(self):
+        ox, oy, dw, dh = self.view
+        iw, ih = self.preview.size
+        x, y, bw, bh = self._crop_box(iw, ih)
+        sx, sy = dw / max(1, iw), dh / max(1, ih)
+        x0, y0 = ox + x * sx, oy + y * sy
+        x1, y1 = x0 + bw * sx, y0 + bh * sy
+        return {
+            "nw": (x0, y0), "n": ((x0 + x1) / 2, y0), "ne": (x1, y0),
+            "w": (x0, (y0 + y1) / 2), "e": (x1, (y0 + y1) / 2),
+            "sw": (x0, y1), "s": ((x0 + x1) / 2, y1), "se": (x1, y1),
+            "_box": (x0, y0, x1, y1),
+        }
+
+    def _crop_press(self, event):
+        if self.preview is None:
+            return
+        h = self._crop_handles_canvas()
+        for name in ("nw", "n", "ne", "w", "e", "sw", "s", "se"):
+            hx, hy = h[name]
+            if abs(event.x - hx) <= 10 and abs(event.y - hy) <= 10:
+                iw, ih = self.preview.size
+                self.crop_drag = {"mode": "resize", "handle": name,
+                                  "start": (event.x, event.y),
+                                  "box": self._crop_box(iw, ih)}
+                self.drag = None
+                return
+        x0, y0, x1, y1 = h["_box"]
+        if x0 <= event.x <= x1 and y0 <= event.y <= y1:
+            iw, ih = self.preview.size
+            self.crop_drag = {"mode": "move", "start": (event.x, event.y),
+                              "box": self._crop_box(iw, ih)}
+            self.drag = None
+
+    def _crop_motion(self, event):
+        if not self.crop_drag or self.preview is None:
+            return
+        ox, oy, dw, dh = self.view
+        iw, ih = self.preview.size
+        sx, sy = dw / max(1, iw), dh / max(1, ih)
+        dx = (event.x - self.crop_drag["start"][0]) / max(0.001, sx)
+        dy = (event.y - self.crop_drag["start"][1]) / max(0.001, sy)
+        x, y, bw, bh = self.crop_drag["box"]
+        if self.crop_drag["mode"] == "move":
+            nx = min(max(0.0, x + dx), iw - bw)
+            ny = min(max(0.0, y + dy), ih - bh)
+            self.crop_offset = [min(1.0, max(0.0, (nx + bw / 2) / iw)),
+                                min(1.0, max(0.0, (ny + bh / 2) / ih))]
+        else:
+            nb = self._crop_resize(self.crop_drag["handle"], (x, y, bw, bh), dx, dy, iw, ih)
+            self._apply_crop_box(nb, iw, ih)
+        self._update_crop_info()
+        self._render()
+
+    def _crop_resize(self, handle, box, dx, dy, W, H):
+        x, y, bw, bh = box
+        min_size = 24
+        if self.crop_ratio.get() == "custom":
+            if "w" in handle:
+                nx = max(0, min(x + dx, x + bw - min_size))
+                bw = x + bw - nx
+                x = nx
+            if "e" in handle:
+                bw = max(min_size, min(bw + dx, W - x))
+            if "n" in handle:
+                ny = max(0, min(y + dy, y + bh - min_size))
+                bh = y + bh - ny
+                y = ny
+            if "s" in handle:
+                bh = max(min_size, min(bh + dy, H - y))
+            return (int(round(x)), int(round(y)), int(round(bw)), int(round(bh)))
+
+        r = CROP_RATIOS.get(self.crop_ratio.get(), 16 / 9)
+        anchor_right = "w" in handle
+        anchor_bottom = "n" in handle
+        bx = x + bw if anchor_right else x
+        by = y + bh if anchor_bottom else y
+        w = bw + (dx if "e" in handle else -dx if "w" in handle else 0)
+        h = bh + (dy if "s" in handle else -dy if "n" in handle else 0)
+        if "e" not in handle and "w" not in handle:
+            w = h * r
+        if "n" not in handle and "s" not in handle:
+            h = w / r
+        if len(handle) == 2:
+            w = max(w, h * r)
+            h = w / r
+        max_w = bx if anchor_right else W - bx
+        max_h = by if anchor_bottom else H - by
+        limit = min(max_w, max_h * r)
+        w = max(min(min_size, limit), min(w, limit))
+        h = w / r
+        nx = bx - w if anchor_right else bx
+        ny = by - h if anchor_bottom else by
+        return (int(round(nx)), int(round(ny)), int(round(w)), int(round(h)))
+
+    def _apply_crop_box(self, box, iw, ih):
+        x, y, bw, bh = box
+        fw = self.full_size[0] or iw
+        k = fw / max(1, iw)
+        if self.crop_ratio.get() == "custom":
+            self.crop_w.set(str(max(8, int(round(bw * k)))))
+            self.crop_h.set(str(max(8, int(round(bh * k)))))
+        else:
+            mw, _mh = crop_max_for(iw, ih, self.crop_ratio.get())
+            self.crop_scale = max(0.1, min(1.0, bw / max(1, mw)))
+        self.crop_offset = [min(1.0, max(0.0, (x + bw / 2) / max(1, iw))),
+                            min(1.0, max(0.0, (y + bh / 2) / max(1, ih)))]
+
     def _rect_to_canvas(self, rect):
         ox, oy, dw, dh = self.view
         return (ox + rect[0] * dw, oy + rect[1] * dh,
@@ -1129,6 +1468,9 @@ class BlurApp:
         if self.preview is None:
             return
         self.canvas.focus_set()
+        if self.work_mode.get() == "crop":
+            self._crop_press(event)
+            return
         handle = self._hit_handle(event.x, event.y)
         if handle:
             self.drag = {"type": "resize", "handle": handle}
@@ -1149,6 +1491,9 @@ class BlurApp:
         self._sync_region_selection()
 
     def _on_motion(self, event):
+        if self.work_mode.get() == "crop":
+            self._crop_motion(event)
+            return
         if not self.drag:
             return
         kind = self.drag["type"]
@@ -1189,6 +1534,9 @@ class BlurApp:
         self._schedule_preview()
 
     def _on_release(self, _event):
+        if self.crop_drag:
+            self.crop_drag = None
+            return
         if not self.drag:
             return
         if self.drag["type"] == "new":
@@ -1332,7 +1680,8 @@ class BlurApp:
         if not self.items:
             messagebox.showwarning("还没有图片", "请先添加要打码的图片或文件夹。")
             return
-        if not self.rects:
+        crop_mode = self.work_mode.get() == "crop"
+        if not crop_mode and not self.rects:
             messagebox.showwarning("没有打码区域", "请先在预览图上画出至少一个打码区域。")
             return
 
@@ -1346,13 +1695,20 @@ class BlurApp:
         jobs = build_jobs(self.items, outdir, suffix, self.prefix.get().strip(),
                           bool(self.numbering.get()), self._numbering_start(),
                           bool(self.pad.get()), bool(self.lossless.get()))
-        self.rects = [[float(v) for v in r] for r in self.rects]
-        self._refresh_regions_list()
-
-        opts = dict(rects=[tuple(r) for r in self.rects], strength=self.strength.get(),
-                    mode=self.mode.get(),
-                    feather=max(0, int(round(self.feather.get()))),
-                    fill=self.fill_color, quality=self.quality.get())
+        if crop_mode:
+            opts = dict(crop=dict(ratio=self.crop_ratio.get(),
+                                  scale=self.crop_scale,
+                                  w=self._num(self.crop_w, 1920),
+                                  h=self._num(self.crop_h, 1080),
+                                  ox=self.crop_offset[0], oy=self.crop_offset[1]),
+                        quality=self.quality.get())
+        else:
+            self.rects = [[float(v) for v in r] for r in self.rects]
+            self._refresh_regions_list()
+            opts = dict(rects=[tuple(r) for r in self.rects], strength=self.strength.get(),
+                        mode=self.mode.get(),
+                        feather=max(0, int(round(self.feather.get()))),
+                        fill=self.fill_color, quality=self.quality.get())
 
         self.stop_event.clear()
         self.stats = {"ok": 0, "err": 0, "skip": 0}
@@ -1454,19 +1810,46 @@ def run_cli(args) -> int:
         return 2
 
     rects = [parse_rect(t) for t in args.rect] if args.rect else [DEFAULT_RECT]
+
+    crop = None
+    if args.crop_size:
+        try:
+            cw, ch = [int(v) for v in str(args.crop_size).lower().replace("x", ",").split(",")]
+            crop = dict(ratio="custom", w=cw, h=ch, ox=0.5, oy=0.5)
+        except Exception:
+            print("--crop-size 格式应为 宽x高，例如 1920x1080", file=sys.stderr)
+            return 2
+    elif args.crop_ratio:
+        try:
+            ox, oy = [float(v) for v in str(args.crop_pos).split(",")]
+        except Exception:
+            ox, oy = 0.5, 0.5
+        crop = dict(ratio=args.crop_ratio, scale=args.crop_scale, ox=ox, oy=oy)
+
+    suffix = args.suffix
+    if crop and suffix == "_已打码":
+        suffix = "_裁剪"
+
     outdir = Path(args.output) if args.output else items[0][0].parent / "打码输出"
-    jobs = build_jobs(items, outdir, args.suffix, args.prefix, args.numbering,
+    jobs = build_jobs(items, outdir, suffix, args.prefix, args.numbering,
                       args.start, args.pad, not args.no_lossless)
     print(f"共 {len(jobs)} 张，输出到：{outdir}")
-    print(f"区域：{rects}  模式：{MODE_LABELS.get(args.mode, args.mode)}  "
-          f"强度：{args.strength}")
+    if crop:
+        print(f"裁剪：{'自定义 %d×%d' % (crop['w'], crop['h']) if crop['ratio'] == 'custom' else crop['ratio']}"
+              f"  位置：{crop['ox']}, {crop['oy']}")
+    else:
+        print(f"区域：{rects}  模式：{MODE_LABELS.get(args.mode, args.mode)}  "
+              f"强度：{args.strength}")
 
     ok = err = 0
     for src, dst in jobs:
         try:
-            process_one(src, dst, rects=rects, strength=args.strength, mode=args.mode,
-                        feather=args.feather, fill=parse_color(args.fill),
-                        quality=args.quality)
+            if crop:
+                process_one(src, dst, crop=crop, quality=args.quality)
+            else:
+                process_one(src, dst, rects=rects, strength=args.strength, mode=args.mode,
+                            feather=args.feather, fill=parse_color(args.fill),
+                            quality=args.quality)
             ok += 1
             print(f"  [OK] {src.name} -> {dst}")
         except Exception as exc:
@@ -1500,6 +1883,14 @@ def build_arg_parser():
     p.add_argument("--quality", type=int, default=95, help="JPG/WebP 画质，默认 95")
     p.add_argument("--no-lossless", action="store_true",
                    help="按原格式保存（默认输出无损 PNG）")
+    p.add_argument("--crop-ratio", choices=list(CROP_RATIOS.keys()),
+                   help="批量裁剪为指定比例（16:9 / 4:3 / 1:1 / 9:16 / 3:4）")
+    p.add_argument("--crop-size", metavar="WxH",
+                   help="批量裁剪为指定像素，如 1920x1080")
+    p.add_argument("--crop-scale", type=float, default=1.0,
+                   help="比例模式下裁剪框缩放，0.1~1，默认 1（最大）")
+    p.add_argument("--crop-pos", default="0.5,0.5",
+                   help="裁剪框中心位置 0~1，默认 0.5,0.5（居中）")
     p.add_argument("--no-recursive", action="store_true", help="文件夹不递归子目录")
     return p
 
